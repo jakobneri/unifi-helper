@@ -63,6 +63,7 @@ class UnifiClient:
         self.username = config["username"]
         self.password = config["password"]
         self.site = config.get("site", "default")
+        self.mode = config.get("mode", "unifi-os")  # "unifi-os" or "standalone"
         self.session = requests.Session()
         self.session.verify = False
         self.csrf_token = None
@@ -72,8 +73,16 @@ class UnifiClient:
             self.session.cookies.update(saved["cookies"])
         self.csrf_token = saved.get("csrf_token")
 
+    def _url(self, path):
+        if self.mode == "standalone":
+            return f"{self.host}/api/s/{self.site}/{path}"
+        return f"{self.host}/proxy/network/api/s/{self.site}/{path}"
+
     def login(self):
-        url = f"{self.host}/api/auth/login"
+        if self.mode == "standalone":
+            url = f"{self.host}/api/login"
+        else:
+            url = f"{self.host}/api/auth/login"
         try:
             resp = self.session.post(
                 url,
@@ -83,7 +92,9 @@ class UnifiClient:
         except requests.exceptions.HTTPError as e:
             print(f"Login failed: {e}", file=sys.stderr)
             sys.exit(1)
-        self.csrf_token = resp.headers.get("X-Csrf-Token")
+        # CSRF token only exists on UniFi OS
+        if self.mode == "unifi-os":
+            self.csrf_token = resp.headers.get("X-Csrf-Token")
         save_session({
             "cookies": dict(self.session.cookies),
             "csrf_token": self.csrf_token,
@@ -106,13 +117,11 @@ class UnifiClient:
         return resp
 
     def get_devices(self):
-        url = f"{self.host}/proxy/network/api/s/{self.site}/stat/device"
-        resp = self._request("GET", url)
+        resp = self._request("GET", self._url("stat/device"))
         return resp.json().get("data", [])
 
     def set_led(self, device_id, state):
-        url = f"{self.host}/proxy/network/api/s/{self.site}/rest/device/{device_id}"
-        self._request("PUT", url, json={"led_override": state})
+        self._request("PUT", self._url(f"rest/device/{device_id}"), json={"led_override": state})
 
 
 # ---------------------------------------------------------------------------
@@ -152,9 +161,24 @@ def cmd_config(_args):
     print("UniFi LED Configuration Setup")
     print("=" * 34)
 
-    host = input(f"Host [{existing.get('host', 'https://localhost')}]: ").strip()
+    print("Mode:")
+    print("  1) standalone  — UniFi Network Server on PC/Raspberry Pi (port 8443)")
+    print("  2) unifi-os    — UDM / UDM Pro / UDM SE (port 443)")
+    existing_mode = existing.get("mode", "unifi-os")
+    mode_default = "1" if existing_mode == "standalone" else "2"
+    mode_input = input(f"Choose [1/2, default {mode_default}]: ").strip()
+    if mode_input == "1":
+        mode = "standalone"
+    elif mode_input == "2":
+        mode = "unifi-os"
+    else:
+        mode = existing_mode
+
+    default_host = "https://localhost:8443" if mode == "standalone" else "https://localhost"
+    existing_host = existing.get("host", default_host)
+    host = input(f"Host [{existing_host}]: ").strip()
     if not host:
-        host = existing.get("host", "https://localhost")
+        host = existing_host
 
     username = input(f"Username [{existing.get('username', 'admin')}]: ").strip()
     if not username:
@@ -168,8 +192,8 @@ def cmd_config(_args):
     if not site:
         site = existing.get("site", "default")
 
-    save_config({"host": host, "username": username, "password": password, "site": site})
-    print(f"\nConfig saved to {CONFIG_FILE}")
+    save_config({"host": host, "username": username, "password": password, "site": site, "mode": mode})
+    print(f"\nConfig saved to {CONFIG_FILE} (mode: {mode})")
 
 
 def cmd_list(_args):

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unifi-led"
+version = "0.1.0"
+description = "Control LED overrides on UniFi devices via the Network API"
+requires-python = ">=3.8"
+dependencies = ["requests"]
+
+[project.optional-dependencies]
+pretty = ["tabulate"]
+
+[project.scripts]
+unifi-led = "unifi_led:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["unifi_led*"]

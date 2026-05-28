@@ -175,7 +175,11 @@ def cmd_config(_args):
         mode = existing_mode
 
     default_host = "https://localhost:8443" if mode == "standalone" else "https://localhost"
-    existing_host = existing.get("host", default_host)
+    # Reset host default when mode changes to avoid carrying over the wrong port
+    if mode != existing_mode:
+        existing_host = default_host
+    else:
+        existing_host = existing.get("host", default_host)
     host = input(f"Host [{existing_host}]: ").strip()
     if not host:
         host = existing_host

@@ -7,24 +7,47 @@ Control the LED override state and schedule of UniFi devices from the command li
 ## Requirements
 
 - Python 3.8+
-- `requests` (`pip install requests`)
 - UniFi Network application running on the same machine (or reachable on your LAN)
-- Optional: `tabulate` for prettier output (`pip install tabulate`)
+- Optional: `tabulate` for prettier output (see below)
 
 ---
 
 ## Installation
 
+> **Debian / Ubuntu / Raspberry Pi OS**: system Python is protected (PEP 668).  
+> Use a virtual environment — the commands below handle that automatically.
+
 ```bash
 git clone https://github.com/jakobneri/unify-led.git
 cd unify-led
+
+# create a virtual environment and install
+python3 -m venv ~/.venv/unifi-led
+source ~/.venv/unifi-led/bin/activate
 pip install -e .
+
+# optional: prettier tables
+pip install tabulate
 ```
 
-The `unifi-led` command is now on your PATH. You can also run it without installing:
+The `unifi-led` command is now available **while the venv is active**.
+
+**Activate the venv in future terminal sessions:**
 
 ```bash
-python -m unifi_led
+source ~/.venv/unifi-led/bin/activate
+```
+
+Or add that line to your `~/.bashrc` so it activates automatically on login:
+
+```bash
+echo 'source ~/.venv/unifi-led/bin/activate' >> ~/.bashrc
+```
+
+You can also run without activating the venv:
+
+```bash
+~/.venv/unifi-led/bin/unifi-led --help
 ```
 
 ---

@@ -115,7 +115,18 @@ class UnifiClient:
             )
             resp.raise_for_status()
         except requests.exceptions.HTTPError as e:
-            print(f"Login failed: {e}", file=sys.stderr)
+            body = e.response.text.strip() if e.response is not None else ""
+            detail = f"\n{body}" if body else ""
+            print(f"Login failed: {e}{detail}", file=sys.stderr)
+            if e.response is not None and e.response.status_code == 403:
+                print(
+                    "\n403 usually means either the credentials are rejected before "
+                    "auth even runs, or 'mode' doesn't match this controller "
+                    "(standalone vs unifi-os). Run 'unifi-restart config' and double-"
+                    "check: UDM/UDM Pro/UDM SE -> unifi-os; self-hosted Network "
+                    "Server (e.g. on a Pi/Cloud Key) -> standalone.",
+                    file=sys.stderr,
+                )
             sys.exit(1)
         # CSRF token only exists on UniFi OS
         if self.mode == "unifi-os":

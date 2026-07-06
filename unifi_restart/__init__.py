@@ -1,8 +1,18 @@
-"""unifi-led: Control LED overrides on UniFi devices via the Network API."""
+"""unifi-restart: Restart an entire UniFi network (all switches, APs, gateway)
+on a daily schedule via a systemd timer, driven from a device on that same
+network (e.g. a Raspberry Pi).
+
+Because the controlling device is itself normally connected through one of
+the UniFi devices being restarted, it will briefly lose network connectivity
+during the run. Restart commands are fired off without waiting for devices
+to come back, and the gateway/UDM is restarted last so the run has the best
+chance of reaching every device before local connectivity drops.
+"""
 
 import argparse
 import getpass
 import json
+import logging
 import os
 import re
 import subprocess
@@ -14,10 +24,17 @@ import requests
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-CONFIG_DIR = Path.home() / ".config" / "unifi-led"
+CONFIG_DIR = Path.home() / ".config" / "unifi-restart"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 SESSION_FILE = CONFIG_DIR / "session.json"
-CRON_MARKER = "# unifi-led-managed"
+STATE_DIR = Path.home() / ".local" / "state" / "unifi-restart"
+LOG_FILE = STATE_DIR / "restart.log"
+
+SERVICE_NAME = "unifi-restart.service"
+TIMER_NAME = "unifi-restart.timer"
+SYSTEMD_DIR = Path("/etc/systemd/system")
+
+REQUEST_TIMEOUT = 10  # seconds; fail fast once the local link starts dropping
 
 
 # ---------------------------------------------------------------------------
@@ -26,7 +43,7 @@ CRON_MARKER = "# unifi-led-managed"
 
 def load_config():
     if not CONFIG_FILE.exists():
-        print("No config found. Run 'unifi-led config' first.", file=sys.stderr)
+        print("No config found. Run 'unifi-restart config' first.", file=sys.stderr)
         sys.exit(1)
     with open(CONFIG_FILE) as f:
         return json.load(f)
@@ -87,6 +104,7 @@ class UnifiClient:
             resp = self.session.post(
                 url,
                 json={"username": self.username, "password": self.password},
+                timeout=REQUEST_TIMEOUT,
             )
             resp.raise_for_status()
         except requests.exceptions.HTTPError as e:
@@ -102,6 +120,7 @@ class UnifiClient:
 
     def _request(self, method, url, **kwargs):
         headers = kwargs.pop("headers", {})
+        kwargs.setdefault("timeout", REQUEST_TIMEOUT)
         if self.csrf_token:
             headers["X-Csrf-Token"] = self.csrf_token
 
@@ -120,8 +139,11 @@ class UnifiClient:
         resp = self._request("GET", self._url("stat/device"))
         return resp.json().get("data", [])
 
-    def set_led(self, device_id, state):
-        self._request("PUT", self._url(f"rest/device/{device_id}"), json={"led_override": state})
+    def restart_device(self, mac, hard=False):
+        payload = {"cmd": "restart", "mac": mac}
+        if hard:
+            payload["reboot_type"] = "hard"
+        self._request("POST", self._url("cmd/devmgr"), json=payload)
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +171,21 @@ def format_table(rows, headers):
 
 
 # ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+def _get_logger():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("unifi_restart")
+    if not logger.handlers:
+        handler = logging.FileHandler(LOG_FILE)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+    return logger
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
@@ -158,7 +195,7 @@ def cmd_config(_args):
         with open(CONFIG_FILE) as f:
             existing = json.load(f)
 
-    print("UniFi LED Configuration Setup")
+    print("UniFi Restart Configuration Setup")
     print("=" * 34)
 
     print("Mode:")
@@ -214,143 +251,24 @@ def cmd_list(_args):
             d.get("name") or d.get("hostname") or "—",
             d.get("mac", "—"),
             d.get("model", "—"),
-            d.get("led_override", "default"),
+            d.get("type", "—"),
         ]
         for d in devices
     ]
-    print(format_table(rows, ["Name", "MAC", "Model", "LED Override"]))
+    print(format_table(rows, ["Name", "MAC", "Model", "Type"]))
 
 
-def cmd_set(args):
-    state = args.state
-    config = load_config()
-    client = UnifiClient(config)
-    devices = _fetch_devices(client)
-
-    if args.target == "all":
-        targets = devices
-    else:
-        mac_lower = args.target.lower()
-        targets = [d for d in devices if d.get("mac", "").lower() == mac_lower]
-        if not targets:
-            print(f"No device found with MAC {args.target}", file=sys.stderr)
-            sys.exit(1)
-
-    exit_code = 0
-    for device in targets:
-        device_id = device["_id"]
-        label = device.get("name") or device.get("mac") or device_id
-        try:
-            client.set_led(device_id, state)
-            print(f"{label}: led_override → {state}")
-        except (requests.exceptions.ConnectionError, requests.exceptions.HTTPError) as e:
-            print(f"{label}: error — {e}", file=sys.stderr)
-            exit_code = 1
-
-    sys.exit(exit_code)
+# Gateway/UDM devices are restarted last: they usually sit upstream of
+# switches and APs, so restarting them first would cut the run short by
+# taking the whole LAN's uplink down before other devices get their command.
+_GATEWAY_TYPES = {"ugw", "udm"}
 
 
-# ---------------------------------------------------------------------------
-# Cron helpers
-# ---------------------------------------------------------------------------
-
-def _get_crontab():
-    result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
-    if result.returncode != 0:
-        return []
-    return result.stdout.splitlines()
+def _restart_order(devices):
+    return sorted(devices, key=lambda d: 1 if d.get("type") in _GATEWAY_TYPES else 0)
 
 
-def _set_crontab(lines):
-    content = "\n".join(lines)
-    if content and not content.endswith("\n"):
-        content += "\n"
-    proc = subprocess.run(["crontab", "-"], input=content, text=True)
-    if proc.returncode != 0:
-        print("Failed to update crontab.", file=sys.stderr)
-        sys.exit(1)
-
-
-def _strip_managed(lines):
-    out = []
-    i = 0
-    while i < len(lines):
-        if lines[i].strip() == CRON_MARKER:
-            i += 2  # skip marker + entry
-        else:
-            out.append(lines[i])
-            i += 1
-    return out
-
-
-def _resolve_script():
-    import shutil
-    path = shutil.which("unifi-led")
-    if path:
-        return path
-    return f"{sys.executable} -m unifi_led"
-
-
-def _parse_time(t):
-    m = re.match(r"^(\d{1,2}):(\d{2})$", t)
-    if not m:
-        print(f"Invalid time '{t}'. Use HH:MM.", file=sys.stderr)
-        sys.exit(1)
-    return int(m.group(1)), int(m.group(2))
-
-
-def cmd_schedule(args):
-    if args.remove:
-        lines = _get_crontab()
-        _set_crontab(_strip_managed(lines))
-        print("Removed managed crontab entries.")
-        return
-
-    if not args.on or not args.off:
-        print("Both --on and --off are required (or use --remove).", file=sys.stderr)
-        sys.exit(1)
-
-    on_h, on_m = _parse_time(args.on)
-    off_h, off_m = _parse_time(args.off)
-    script = _resolve_script()
-
-    lines = _strip_managed(_get_crontab())
-    lines += [
-        CRON_MARKER,
-        f"{on_m} {on_h} * * * {script} set all on",
-        CRON_MARKER,
-        f"{off_m} {off_h} * * * {script} set all off",
-    ]
-    _set_crontab(lines)
-    print(f"Scheduled: on at {on_h:02d}:{on_m:02d}, off at {off_h:02d}:{off_m:02d}")
-
-
-def cmd_status(_args):
-    lines = _get_crontab()
-    managed = []
-    i = 0
-    while i < len(lines):
-        if lines[i].strip() == CRON_MARKER and i + 1 < len(lines):
-            managed.append(lines[i + 1])
-            i += 2
-        else:
-            i += 1
-
-    if managed:
-        print("Managed schedule:")
-        for entry in managed:
-            parts = entry.split()
-            if len(parts) >= 6:
-                minute, hour = parts[0], parts[1]
-                action = " ".join(parts[5:])
-                print(f"  {int(hour):02d}:{minute.zfill(2)}  {action}")
-            else:
-                print(f"  {entry}")
-    else:
-        print("No managed schedule.")
-
-    print()
-
+def cmd_run(args):
     config = load_config()
     client = UnifiClient(config)
     devices = _fetch_devices(client)
@@ -359,15 +277,142 @@ def cmd_status(_args):
         print("No devices found.")
         return
 
-    rows = [
-        [
-            d.get("name") or d.get("hostname") or "—",
-            d.get("mac", "—"),
-            d.get("led_override", "default"),
-        ]
-        for d in devices
-    ]
-    print(format_table(rows, ["Name", "MAC", "LED Override"]))
+    devices = _restart_order(devices)
+
+    if args.dry_run:
+        print("Would restart the following devices (in this order):")
+        for d in devices:
+            label = d.get("name") or d.get("hostname") or d.get("mac")
+            print(f"  {label} ({d.get('type', '?')})")
+        return
+
+    logger = _get_logger()
+    logger.info("Starting full network restart (%d devices, hard=%s)", len(devices), args.hard)
+
+    exit_code = 0
+    for d in devices:
+        mac = d.get("mac")
+        label = d.get("name") or d.get("hostname") or mac
+        try:
+            client.restart_device(mac, hard=args.hard)
+            print(f"{label}: restart command sent")
+            logger.info("%s: restart command sent", label)
+        except (requests.exceptions.ConnectionError, requests.exceptions.HTTPError) as e:
+            # Expected once the device carrying our own uplink goes down.
+            print(f"{label}: error — {e}", file=sys.stderr)
+            logger.warning("%s: error — %s", label, e)
+            exit_code = 1
+
+    logger.info("Restart sequence complete (device reboots happen asynchronously)")
+    sys.exit(exit_code)
+
+
+# ---------------------------------------------------------------------------
+# systemd timer management
+# ---------------------------------------------------------------------------
+
+def _parse_time(t):
+    m = re.match(r"^(\d{1,2}):(\d{2})$", t)
+    if not m:
+        print(f"Invalid time '{t}'. Use HH:MM.", file=sys.stderr)
+        sys.exit(1)
+    hour, minute = int(m.group(1)), int(m.group(2))
+    if not (0 <= hour < 24 and 0 <= minute < 60):
+        print(f"Invalid time '{t}'. Use HH:MM.", file=sys.stderr)
+        sys.exit(1)
+    return hour, minute
+
+
+def _target_user():
+    return os.environ.get("SUDO_USER") or getpass.getuser()
+
+
+def _target_home(user):
+    import pwd
+    try:
+        return Path(pwd.getpwnam(user).pw_dir)
+    except KeyError:
+        return Path.home()
+
+
+def _resolve_script(user, home):
+    venv_bin = home / ".venv" / "unifi-restart" / "bin" / "unifi-restart"
+    if venv_bin.exists():
+        return str(venv_bin)
+    import shutil
+    path = shutil.which("unifi-restart")
+    if path:
+        return path
+    return f"{sys.executable} -m unifi_restart"
+
+
+def cmd_install_timer(args):
+    if os.geteuid() != 0:
+        print("Run this with sudo — systemd unit files live under /etc/systemd/system.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.remove:
+        subprocess.run(["systemctl", "disable", "--now", TIMER_NAME], check=False)
+        (SYSTEMD_DIR / SERVICE_NAME).unlink(missing_ok=True)
+        (SYSTEMD_DIR / TIMER_NAME).unlink(missing_ok=True)
+        subprocess.run(["systemctl", "daemon-reload"], check=False)
+        print("Removed the unifi-restart timer.")
+        return
+
+    hour, minute = _parse_time(args.time)
+    user = _target_user()
+    home = _target_home(user)
+    script = _resolve_script(user, home)
+    hard_flag = " --hard" if args.hard else ""
+
+    service = f"""[Unit]
+Description=UniFi network restart (all devices)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User={user}
+Environment=HOME={home}
+ExecStart={script} run{hard_flag}
+"""
+
+    timer = f"""[Unit]
+Description=Daily UniFi network restart at {hour:02d}:{minute:02d}
+
+[Timer]
+OnCalendar=*-*-* {hour:02d}:{minute:02d}:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
+
+    (SYSTEMD_DIR / SERVICE_NAME).write_text(service)
+    (SYSTEMD_DIR / TIMER_NAME).write_text(timer)
+    subprocess.run(["systemctl", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "enable", "--now", TIMER_NAME], check=True)
+    print(f"Installed {TIMER_NAME}: daily restart at {hour:02d}:{minute:02d}, running as user '{user}'.")
+    print(f"Service will execute: {script} run{hard_flag}")
+
+
+def cmd_status(_args):
+    result = subprocess.run(
+        ["systemctl", "list-timers", TIMER_NAME, "--all", "--no-pager"],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0 and TIMER_NAME in result.stdout:
+        print(result.stdout.strip())
+    else:
+        print(f"{TIMER_NAME} is not installed. Run 'sudo unifi-restart install-timer' to set it up.")
+
+    print()
+    if LOG_FILE.exists():
+        print(f"Last log entries ({LOG_FILE}):")
+        for line in LOG_FILE.read_text().splitlines()[-10:]:
+            print(f"  {line}")
+    else:
+        print("No restart log yet.")
 
 
 # ---------------------------------------------------------------------------
@@ -391,24 +436,24 @@ def _fetch_devices(client):
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="unifi-led",
-        description="Control LED overrides on UniFi devices.",
+        prog="unifi-restart",
+        description="Restart an entire UniFi network (switches, APs, gateway) on a schedule.",
     )
     sub = parser.add_subparsers(dest="command", metavar="command")
 
     sub.add_parser("config", help="Interactive setup wizard")
-    sub.add_parser("list", help="List all devices and their LED state")
+    sub.add_parser("list", help="List all devices that would be restarted")
 
-    p_set = sub.add_parser("set", help="Set LED override for a device or all devices")
-    p_set.add_argument("target", metavar="mac|all", help="Device MAC address or 'all'")
-    p_set.add_argument("state", choices=["on", "off", "default"])
+    p_run = sub.add_parser("run", help="Restart every device now")
+    p_run.add_argument("--dry-run", action="store_true", help="Show restart order without sending commands")
+    p_run.add_argument("--hard", action="store_true", help="Power-cycle PoE devices instead of a soft reboot")
 
-    p_sched = sub.add_parser("schedule", help="Manage LED on/off schedule via crontab")
-    p_sched.add_argument("--on", metavar="HH:MM", help="Time to turn LEDs on")
-    p_sched.add_argument("--off", metavar="HH:MM", help="Time to turn LEDs off")
-    p_sched.add_argument("--remove", action="store_true", help="Remove managed entries")
+    p_install = sub.add_parser("install-timer", help="Install/remove the daily systemd timer (requires sudo)")
+    p_install.add_argument("--time", default="03:00", metavar="HH:MM", help="Daily restart time (default 03:00)")
+    p_install.add_argument("--hard", action="store_true", help="Have the timer run a hard (power-cycle) restart")
+    p_install.add_argument("--remove", action="store_true", help="Remove the installed timer")
 
-    sub.add_parser("status", help="Show schedule and current LED state of all devices")
+    sub.add_parser("status", help="Show timer status and recent restart log entries")
 
     args = parser.parse_args()
 
@@ -419,8 +464,8 @@ def main():
     dispatch = {
         "config": cmd_config,
         "list": cmd_list,
-        "set": cmd_set,
-        "schedule": cmd_schedule,
+        "run": cmd_run,
+        "install-timer": cmd_install_timer,
         "status": cmd_status,
     }
     dispatch[args.command](args)

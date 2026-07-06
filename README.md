@@ -1,9 +1,30 @@
 # unifi-restart
 
 Restart your **entire UniFi network** — every switch, access point, and the
-gateway/UDM — on a daily schedule, driven from a device that lives on that
-same network (e.g. a Raspberry Pi). Talks directly to the UniFi Network API
-— no cloud, no UniFi account required.
+gateway — on a daily schedule, driven from a device that lives on that same
+network (e.g. a Raspberry Pi). Devices are rebooted directly over **SSH**
+using their local console credentials — no UniFi Network API login, no
+Ubiquiti SSO account, nothing that can lock you out.
+
+---
+
+## Why SSH instead of the UniFi Network API
+
+The UniFi Network API requires logging in with a UniFi account. Repeated
+failed logins (e.g. while still getting the config right) can get that
+account **locked** (`AUTHENTICATION_FAILED_ACCOUNT_LOCKED`) — which is
+exactly the kind of thing you don't want a daily automated job to risk.
+
+SSH sidesteps that entirely:
+
+- The **gateway** (e.g. a UDM or UniFi Express) has its own local root
+  account, enabled under Settings → System → Advanced/Console access.
+- **Switches and APs** accept a shared SSH username/password that UniFi
+  pushes out to every adopted device once you set it under
+  Settings → System → SSH Authentication ("Device SSH Authentication").
+
+Both are configured once in this tool and used purely to run `reboot` over
+SSH — nothing else.
 
 ---
 
@@ -16,12 +37,12 @@ connectivity during every run**, right along with everything else.
 
 To handle that:
 
-- Restart commands are **fire-and-forget**. The tool sends a `restart` API
-  call per device and moves on immediately — it never waits for a device to
-  come back online (it can't; its own link may already be down).
-- The **gateway/UDM is restarted last**. It usually sits upstream of
-  switches and APs, so restarting it first would cut connectivity to the
-  rest of the network before their commands even go out.
+- Reboots are **fire-and-forget**. The tool opens an SSH connection, sends
+  `reboot`, and moves on immediately — it never waits for a device to come
+  back online (it can't; its own link may already be down).
+- The **gateway is restarted last**. It usually sits upstream of switches
+  and APs, so restarting it first would cut connectivity to the rest of the
+  network before their commands even go out.
 - Errors partway through a run (typically starting with whichever device
   carries the Pi's own uplink) are **expected**, not a sign the tool is
   broken. They're logged, and the run continues attempting the remaining
@@ -35,7 +56,7 @@ To handle that:
 ## Requirements
 
 - Python 3.8+
-- UniFi Network application running on the same machine (or reachable on your LAN)
+- SSH access enabled on the gateway and on adopted switches/APs (see above)
 - `systemd` (default on Raspberry Pi OS / most Debian-based distros) for the daily timer
 - Optional: `tabulate` for prettier `list` output
 
@@ -47,8 +68,8 @@ To handle that:
 > Use a virtual environment — the commands below handle that automatically.
 
 ```bash
-git clone https://github.com/jakobneri/unify-led.git
-cd unify-led
+git clone https://github.com/jakobneri/unifi-helper.git
+cd unifi-helper
 
 # create a virtual environment and install
 python3 -m venv ~/.venv/unifi-restart
@@ -87,33 +108,35 @@ You can also run without activating the venv:
 
 ## Step-by-step setup
 
-### 1. Run the configuration wizard
+### 1. Enable SSH on your devices
+
+- **Gateway** (UDM/UDM Pro/UDM SE/UniFi Express): Settings → System →
+  Advanced (or Console access) → enable SSH, set/confirm the local root
+  password.
+- **Switches/APs**: Settings → System → SSH Authentication → enable "Device
+  SSH Authentication" and set a shared username/password. UniFi pushes this
+  to every adopted device.
+
+### 2. Run the configuration wizard
 
 ```bash
 unifi-restart config
 ```
 
-You will be prompted for:
+For each device you'll be asked for a name, host/IP, SSH port (default
+`22`), SSH username, SSH password, and whether it's the gateway. The wizard
+lets you add, edit, or remove devices in a loop — run it again any time to
+change something.
 
-| Field | Example | Default |
-|-------|---------|---------|
-| Mode | `standalone` or `unifi-os` | `unifi-os` |
-| Host | `https://192.168.1.1` | `https://localhost` |
-| Username | `admin` | `admin` |
-| Password | *(your UniFi password)* | — |
-| Site | `default` | `default` |
-
-Settings are saved to `~/.config/unifi-restart/config.json` (mode 600).
-The session cookie is cached in `~/.config/unifi-restart/session.json` so
-you only log in once.
-
-> **Self-signed certificate**: UniFi uses a self-signed cert by default. The tool skips TLS verification automatically — no extra steps needed.
+Settings are saved to `~/.config/unifi-restart/config.json` (mode 600,
+passwords stored in plain text — protected only by file permissions, same
+as SSH keys typically are on a single-user Pi).
 
 ---
 
-### 2. List your devices
+### 3. List configured devices
 
-Check which devices the tool sees (and in what order they'll be restarted):
+Check what's configured and in what order devices will be restarted (gateway always last):
 
 ```bash
 unifi-restart list
@@ -122,18 +145,16 @@ unifi-restart list
 Example output:
 
 ```
-Name           MAC                Model     Type
--------------  -----------------  --------  ----
-living-room    aa:bb:cc:dd:ee:ff  U6-Pro    uap
-office-switch  11:22:33:44:55:66  USW-Flex  usw
-gateway        99:88:77:66:55:44  UDM-Pro   udm
+Name            Host           Port  Username  Gateway
+--------------  -------------  ----  --------  -------
+Living Room AP  192.168.188.2  22    ubnt      no
+Office Switch   192.168.188.3  22    ubnt      no
+EX7 Gateway     192.168.188.1  22    root      yes
 ```
 
 ---
 
-### 3. Do a dry run
-
-See the exact restart order without sending any commands (gateway/UDM always last):
+### 4. Do a dry run
 
 ```bash
 unifi-restart run --dry-run
@@ -141,21 +162,15 @@ unifi-restart run --dry-run
 
 ---
 
-### 4. Restart everything now
+### 5. Restart everything now
 
 ```bash
 unifi-restart run
 ```
 
-Add `--hard` to power-cycle PoE devices instead of a soft reboot:
-
-```bash
-unifi-restart run --hard
-```
-
 ---
 
-### 5. Install the daily 3am timer
+### 6. Install the daily 3am timer
 
 ```bash
 sudo unifi-restart install-timer
@@ -166,10 +181,10 @@ This installs and enables a `systemd` service + timer
 `unifi-restart run` every day at **03:00**, as the user who invoked `sudo`
 (so it picks up that user's config).
 
-Choose a different time or a hard restart:
+Choose a different time:
 
 ```bash
-sudo unifi-restart install-timer --time 03:30 --hard
+sudo unifi-restart install-timer --time 03:30
 ```
 
 Remove the timer:
@@ -180,7 +195,7 @@ sudo unifi-restart install-timer --remove
 
 ---
 
-### 6. Check status
+### 7. Check status
 
 ```bash
 unifi-restart status
@@ -193,10 +208,10 @@ NEXT                        LEFT     LAST                         PASSED  UNIT  
 Mon 2026-07-07 03:00:00 UTC 8h left  Sun 2026-07-06 03:00:00 UTC   16h ago unifi-restart.timer  unifi-restart.service
 
 Last log entries (~/.local/state/unifi-restart/restart.log):
-  2026-07-06 03:00:01 INFO Starting full network restart (3 devices, hard=False)
-  2026-07-06 03:00:01 INFO living-room: restart command sent
-  2026-07-06 03:00:02 INFO office-switch: restart command sent
-  2026-07-06 03:00:02 WARNING gateway: error — HTTPSConnectionPool(...)
+  2026-07-06 03:00:01 INFO Starting full network restart (3 devices)
+  2026-07-06 03:00:01 INFO Living Room AP: reboot command sent
+  2026-07-06 03:00:02 INFO Office Switch: reboot command sent
+  2026-07-06 03:00:02 WARNING EX7 Gateway: error — timed out
   2026-07-06 03:00:02 INFO Restart sequence complete (device reboots happen asynchronously)
 ```
 
@@ -205,10 +220,10 @@ Last log entries (~/.local/state/unifi-restart/restart.log):
 ## Command reference
 
 ```
-unifi-restart config                          # interactive setup wizard
-unifi-restart list                            # list all devices and restart order
-unifi-restart run [--dry-run] [--hard]        # restart every device now
-unifi-restart install-timer [--time HH:MM] [--hard] [--remove]  # manage the daily systemd timer
+unifi-restart config                          # interactive device configuration (add/edit/remove)
+unifi-restart list                            # list configured devices and restart order
+unifi-restart run [--dry-run]                 # reboot every configured device now
+unifi-restart install-timer [--time HH:MM] [--remove]  # manage the daily systemd timer
 unifi-restart status                          # show timer status + recent log entries
 ```
 
@@ -218,8 +233,7 @@ unifi-restart status                          # show timer status + recent log e
 
 | File | Purpose |
 |------|---------|
-| `~/.config/unifi-restart/config.json` | Host, credentials, site |
-| `~/.config/unifi-restart/session.json` | Cached session cookie + CSRF token |
+| `~/.config/unifi-restart/config.json` | Configured devices (host, SSH credentials, gateway flag) |
 | `~/.local/state/unifi-restart/restart.log` | Log of every restart run |
 | `/etc/systemd/system/unifi-restart.service` | Installed by `install-timer` |
 | `/etc/systemd/system/unifi-restart.timer` | Installed by `install-timer` |

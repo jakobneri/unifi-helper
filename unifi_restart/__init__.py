@@ -2,11 +2,17 @@
 on a daily schedule via a systemd timer, driven from a device on that same
 network (e.g. a Raspberry Pi).
 
+Devices are rebooted over plain SSH using their local console credentials
+(the gateway's root account, and the shared "Device SSH Authentication"
+credentials UniFi pushes to adopted switches/APs) rather than the UniFi
+Network API. That sidesteps the API's session/SSO login entirely, so
+there's nothing to lock you out of.
+
 Because the controlling device is itself normally connected through one of
 the UniFi devices being restarted, it will briefly lose network connectivity
-during the run. Restart commands are fired off without waiting for devices
-to come back, and the gateway/UDM is restarted last so the run has the best
-chance of reaching every device before local connectivity drops.
+during the run. Reboots are fired off without waiting for devices to come
+back, and the gateway is restarted last so the run has the best chance of
+reaching every device before local connectivity drops.
 """
 
 import argparse
@@ -19,14 +25,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-import urllib3
-import requests
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import paramiko
 
 CONFIG_DIR = Path.home() / ".config" / "unifi-restart"
 CONFIG_FILE = CONFIG_DIR / "config.json"
-SESSION_FILE = CONFIG_DIR / "session.json"
 STATE_DIR = Path.home() / ".local" / "state" / "unifi-restart"
 LOG_FILE = STATE_DIR / "restart.log"
 
@@ -34,18 +36,19 @@ SERVICE_NAME = "unifi-restart.service"
 TIMER_NAME = "unifi-restart.timer"
 SYSTEMD_DIR = Path("/etc/systemd/system")
 
-REQUEST_TIMEOUT = 10  # seconds; fail fast once the local link starts dropping
+SSH_TIMEOUT = 8  # seconds; fail fast once the local link starts dropping
+SSH_PORT_DEFAULT = 22
 
 
 # ---------------------------------------------------------------------------
-# Config / session persistence
+# Config persistence
 # ---------------------------------------------------------------------------
 
-def _normalize_host(host):
-    host = host.strip().rstrip("/")
-    if not re.match(r"^https?://", host):
-        host = f"https://{host}"
-    return host
+def _load_config_or_empty():
+    if not CONFIG_FILE.exists():
+        return {"devices": []}
+    with open(CONFIG_FILE) as f:
+        return json.load(f)
 
 
 def load_config():
@@ -63,105 +66,28 @@ def save_config(config):
     os.chmod(CONFIG_FILE, 0o600)
 
 
-def load_session():
-    if SESSION_FILE.exists():
-        with open(SESSION_FILE) as f:
-            return json.load(f)
-    return {}
-
-
-def save_session(data):
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with open(SESSION_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-    os.chmod(SESSION_FILE, 0o600)
-
-
 # ---------------------------------------------------------------------------
-# API client
+# SSH reboot
 # ---------------------------------------------------------------------------
 
-class UnifiClient:
-    def __init__(self, config):
-        self.host = _normalize_host(config["host"])
-        self.username = config["username"]
-        self.password = config["password"]
-        self.site = config.get("site", "default")
-        self.mode = config.get("mode", "unifi-os")  # "unifi-os" or "standalone"
-        self.session = requests.Session()
-        self.session.verify = False
-        self.csrf_token = None
-
-        saved = load_session()
-        if saved.get("cookies"):
-            self.session.cookies.update(saved["cookies"])
-        self.csrf_token = saved.get("csrf_token")
-
-    def _url(self, path):
-        if self.mode == "standalone":
-            return f"{self.host}/api/s/{self.site}/{path}"
-        return f"{self.host}/proxy/network/api/s/{self.site}/{path}"
-
-    def login(self):
-        if self.mode == "standalone":
-            url = f"{self.host}/api/login"
-        else:
-            url = f"{self.host}/api/auth/login"
-        try:
-            resp = self.session.post(
-                url,
-                json={"username": self.username, "password": self.password},
-                timeout=REQUEST_TIMEOUT,
-            )
-            resp.raise_for_status()
-        except requests.exceptions.HTTPError as e:
-            body = e.response.text.strip() if e.response is not None else ""
-            detail = f"\n{body}" if body else ""
-            print(f"Login failed: {e}{detail}", file=sys.stderr)
-            if e.response is not None and e.response.status_code == 403:
-                print(
-                    "\n403 usually means either the credentials are rejected before "
-                    "auth even runs, or 'mode' doesn't match this controller "
-                    "(standalone vs unifi-os). Run 'unifi-restart config' and double-"
-                    "check: UDM/UDM Pro/UDM SE -> unifi-os; self-hosted Network "
-                    "Server (e.g. on a Pi/Cloud Key) -> standalone.",
-                    file=sys.stderr,
-                )
-            sys.exit(1)
-        # CSRF token only exists on UniFi OS
-        if self.mode == "unifi-os":
-            self.csrf_token = resp.headers.get("X-Csrf-Token")
-        save_session({
-            "cookies": dict(self.session.cookies),
-            "csrf_token": self.csrf_token,
-        })
-
-    def _request(self, method, url, **kwargs):
-        headers = kwargs.pop("headers", {})
-        kwargs.setdefault("timeout", REQUEST_TIMEOUT)
-        if self.csrf_token:
-            headers["X-Csrf-Token"] = self.csrf_token
-
-        resp = self.session.request(method, url, headers=headers, **kwargs)
-
-        if resp.status_code == 401:
-            self.login()
-            if self.csrf_token:
-                headers["X-Csrf-Token"] = self.csrf_token
-            resp = self.session.request(method, url, headers=headers, **kwargs)
-
-        resp.raise_for_status()
-        return resp
-
-    def get_devices(self):
-        resp = self._request("GET", self._url("stat/device"))
-        return resp.json().get("data", [])
-
-    def restart_device(self, mac, hard=False):
-        payload = {"cmd": "restart", "mac": mac}
-        if hard:
-            payload["reboot_type"] = "hard"
-        self._request("POST", self._url("cmd/devmgr"), json=payload)
+def _ssh_reboot(device):
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            device["host"],
+            port=device.get("port", SSH_PORT_DEFAULT),
+            username=device["username"],
+            password=device["password"],
+            timeout=SSH_TIMEOUT,
+            banner_timeout=SSH_TIMEOUT,
+            auth_timeout=SSH_TIMEOUT,
+            look_for_keys=False,
+            allow_agent=False,
+        )
+        client.exec_command("reboot", timeout=SSH_TIMEOUT)
+    finally:
+        client.close()
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +114,20 @@ def format_table(rows, headers):
         return "\n".join(lines)
 
 
+def _print_devices(devices):
+    rows = [
+        [
+            d.get("name") or "—",
+            d["host"],
+            d.get("port", SSH_PORT_DEFAULT),
+            d.get("username", "root"),
+            "yes" if d.get("gateway") else "no",
+        ]
+        for d in devices
+    ]
+    print(format_table(rows, ["Name", "Host", "Port", "Username", "Gateway"]))
+
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -204,119 +144,141 @@ def _get_logger():
 
 
 # ---------------------------------------------------------------------------
-# Commands
+# Config wizard
 # ---------------------------------------------------------------------------
 
-def cmd_config(_args):
-    existing = {}
-    if CONFIG_FILE.exists():
-        with open(CONFIG_FILE) as f:
-            existing = json.load(f)
+def _prompt_device(existing=None):
+    existing = existing or {}
 
-    print("UniFi Restart Configuration Setup")
-    print("=" * 34)
+    name = input(f"Name [{existing.get('name', '')}]: ").strip() or existing.get("name", "")
+    host = input(f"Host/IP [{existing.get('host', '')}]: ").strip() or existing.get("host", "")
 
-    print("Mode:")
-    print("  1) standalone  — UniFi Network Server on PC/Raspberry Pi (port 8443)")
-    print("  2) unifi-os    — UDM / UDM Pro / UDM SE (port 443)")
-    existing_mode = existing.get("mode", "unifi-os")
-    mode_default = "1" if existing_mode == "standalone" else "2"
-    mode_input = input(f"Choose [1/2, default {mode_default}]: ").strip()
-    if mode_input == "1":
-        mode = "standalone"
-    elif mode_input == "2":
-        mode = "unifi-os"
-    else:
-        mode = existing_mode
+    port_default = existing.get("port", SSH_PORT_DEFAULT)
+    port_in = input(f"SSH port [{port_default}]: ").strip()
+    port = int(port_in) if port_in else port_default
 
-    default_host = "https://localhost:8443" if mode == "standalone" else "https://localhost"
-    # Reset host default when mode changes to avoid carrying over the wrong port
-    if mode != existing_mode:
-        existing_host = default_host
-    else:
-        existing_host = existing.get("host", default_host)
-    host = input(f"Host [{existing_host}]: ").strip()
-    if not host:
-        host = existing_host
-    host = _normalize_host(host)
+    user_default = existing.get("username", "root")
+    username = input(f"SSH username [{user_default}]: ").strip() or user_default
 
-    username = input(f"Username [{existing.get('username', 'admin')}]: ").strip()
-    if not username:
-        username = existing.get("username", "admin")
-
-    password = getpass.getpass("Password (blank keeps existing): ").strip()
+    password = getpass.getpass("SSH password (blank keeps existing): ").strip()
     if not password:
         password = existing.get("password", "")
 
-    site = input(f"Site [{existing.get('site', 'default')}]: ").strip()
-    if not site:
-        site = existing.get("site", "default")
+    gw_default = "y" if existing.get("gateway") else "n"
+    gw_in = input(f"Is this the gateway/router? [y/N, default {gw_default}]: ").strip().lower()
+    gateway = (gw_in == "y") if gw_in else existing.get("gateway", False)
 
-    save_config({"host": host, "username": username, "password": password, "site": site, "mode": mode})
-    print(f"\nConfig saved to {CONFIG_FILE} (mode: {mode})")
+    return {
+        "name": name,
+        "host": host,
+        "port": port,
+        "username": username,
+        "password": password,
+        "gateway": gateway,
+    }
+
+
+def _prompt_index(devices, verb):
+    if not devices:
+        print("No devices configured.")
+        return None
+    for i, d in enumerate(devices):
+        print(f"  {i + 1}) {d.get('name') or d['host']} ({d['host']})")
+    raw = input(f"Which device to {verb}? [1-{len(devices)}]: ").strip()
+    if not raw.isdigit() or not (1 <= int(raw) <= len(devices)):
+        print("Invalid selection.")
+        return None
+    return int(raw) - 1
+
+
+def cmd_config(_args):
+    config = _load_config_or_empty()
+    devices = config.get("devices", [])
+
+    print("UniFi Restart – Device Configuration (SSH-based)")
+    print("=" * 48)
+    print(
+        "\nEach device needs SSH access via its local console credentials:\n"
+        "  - Gateway (e.g. EX7/UDM): Settings > System > Advanced/Console -> enable SSH, root account\n"
+        "  - Switches/APs: Settings > System > SSH Authentication -> set a shared SSH username/password\n"
+    )
+    print("Current devices:" if devices else "No devices configured yet.")
+    if devices:
+        _print_devices(devices)
+
+    while True:
+        print("\n[a]dd  [e]dit  [r]emove  [d]one")
+        choice = input("Choice: ").strip().lower()
+        if choice == "a":
+            devices.append(_prompt_device())
+        elif choice == "e":
+            idx = _prompt_index(devices, "edit")
+            if idx is not None:
+                devices[idx] = _prompt_device(existing=devices[idx])
+        elif choice == "r":
+            idx = _prompt_index(devices, "remove")
+            if idx is not None:
+                removed = devices.pop(idx)
+                print(f"Removed {removed.get('name') or removed['host']}")
+        elif choice == "d":
+            break
+        else:
+            print("Unknown choice.")
+            continue
+        print("\nCurrent devices:")
+        _print_devices(devices) if devices else print("  (none)")
+
+    save_config({"devices": devices})
+    print(f"\nSaved {len(devices)} device(s) to {CONFIG_FILE}")
 
 
 def cmd_list(_args):
     config = load_config()
-    client = UnifiClient(config)
-    devices = _fetch_devices(client)
-
+    devices = config.get("devices", [])
     if not devices:
-        print("No devices found.")
+        print("No devices configured. Run 'unifi-restart config' first.")
         return
-
-    rows = [
-        [
-            d.get("name") or d.get("hostname") or "—",
-            d.get("mac", "—"),
-            d.get("model", "—"),
-            d.get("type", "—"),
-        ]
-        for d in devices
-    ]
-    print(format_table(rows, ["Name", "MAC", "Model", "Type"]))
+    _print_devices(_restart_order(devices))
 
 
-# Gateway/UDM devices are restarted last: they usually sit upstream of
-# switches and APs, so restarting them first would cut the run short by
-# taking the whole LAN's uplink down before other devices get their command.
-_GATEWAY_TYPES = {"ugw", "udm"}
-
+# ---------------------------------------------------------------------------
+# Restart
+# ---------------------------------------------------------------------------
 
 def _restart_order(devices):
-    return sorted(devices, key=lambda d: 1 if d.get("type") in _GATEWAY_TYPES else 0)
+    # Gateways are restarted last: they usually sit upstream of switches and
+    # APs, so restarting one first would cut the run short by taking the
+    # whole LAN's uplink down before the remaining devices get their command.
+    return sorted(devices, key=lambda d: 1 if d.get("gateway") else 0)
 
 
 def cmd_run(args):
     config = load_config()
-    client = UnifiClient(config)
-    devices = _fetch_devices(client)
-
+    devices = config.get("devices", [])
     if not devices:
-        print("No devices found.")
+        print("No devices configured. Run 'unifi-restart config' first.")
         return
 
     devices = _restart_order(devices)
 
     if args.dry_run:
-        print("Would restart the following devices (in this order):")
+        print("Would reboot the following devices (in this order):")
         for d in devices:
-            label = d.get("name") or d.get("hostname") or d.get("mac")
-            print(f"  {label} ({d.get('type', '?')})")
+            label = d.get("name") or d["host"]
+            print(f"  {label} ({d['host']}){' [gateway]' if d.get('gateway') else ''}")
         return
 
     logger = _get_logger()
-    logger.info("Starting full network restart (%d devices, hard=%s)", len(devices), args.hard)
+    logger.info("Starting full network restart (%d devices)", len(devices))
 
     exit_code = 0
     for d in devices:
-        mac = d.get("mac")
-        label = d.get("name") or d.get("hostname") or mac
+        label = d.get("name") or d["host"]
         try:
-            client.restart_device(mac, hard=args.hard)
-            print(f"{label}: restart command sent")
-            logger.info("%s: restart command sent", label)
-        except (requests.exceptions.ConnectionError, requests.exceptions.HTTPError) as e:
+            _ssh_reboot(d)
+            print(f"{label}: reboot command sent")
+            logger.info("%s: reboot command sent", label)
+        except Exception as e:
             # Expected once the device carrying our own uplink goes down.
             print(f"{label}: error — {e}", file=sys.stderr)
             logger.warning("%s: error — %s", label, e)
@@ -382,7 +344,6 @@ def cmd_install_timer(args):
     user = _target_user()
     home = _target_home(user)
     script = _resolve_script(user, home)
-    hard_flag = " --hard" if args.hard else ""
 
     service = f"""[Unit]
 Description=UniFi network restart (all devices)
@@ -393,7 +354,7 @@ Wants=network-online.target
 Type=oneshot
 User={user}
 Environment=HOME={home}
-ExecStart={script} run{hard_flag}
+ExecStart={script} run
 """
 
     timer = f"""[Unit]
@@ -412,7 +373,7 @@ WantedBy=timers.target
     subprocess.run(["systemctl", "daemon-reload"], check=True)
     subprocess.run(["systemctl", "enable", "--now", TIMER_NAME], check=True)
     print(f"Installed {TIMER_NAME}: daily restart at {hour:02d}:{minute:02d}, running as user '{user}'.")
-    print(f"Service will execute: {script} run{hard_flag}")
+    print(f"Service will execute: {script} run")
 
 
 def cmd_status(_args):
@@ -435,41 +396,24 @@ def cmd_status(_args):
 
 
 # ---------------------------------------------------------------------------
-# Shared helpers
-# ---------------------------------------------------------------------------
-
-def _fetch_devices(client):
-    try:
-        return client.get_devices()
-    except requests.exceptions.ConnectionError as e:
-        print(f"Connection error: {e}", file=sys.stderr)
-        sys.exit(1)
-    except requests.exceptions.HTTPError as e:
-        print(f"API error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-
-# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
         prog="unifi-restart",
-        description="Restart an entire UniFi network (switches, APs, gateway) on a schedule.",
+        description="Restart an entire UniFi network (switches, APs, gateway) over SSH, on a schedule.",
     )
     sub = parser.add_subparsers(dest="command", metavar="command")
 
-    sub.add_parser("config", help="Interactive setup wizard")
-    sub.add_parser("list", help="List all devices that would be restarted")
+    sub.add_parser("config", help="Interactive device configuration (add/edit/remove)")
+    sub.add_parser("list", help="List configured devices and restart order")
 
-    p_run = sub.add_parser("run", help="Restart every device now")
+    p_run = sub.add_parser("run", help="Reboot every configured device now")
     p_run.add_argument("--dry-run", action="store_true", help="Show restart order without sending commands")
-    p_run.add_argument("--hard", action="store_true", help="Power-cycle PoE devices instead of a soft reboot")
 
     p_install = sub.add_parser("install-timer", help="Install/remove the daily systemd timer (requires sudo)")
     p_install.add_argument("--time", default="03:00", metavar="HH:MM", help="Daily restart time (default 03:00)")
-    p_install.add_argument("--hard", action="store_true", help="Have the timer run a hard (power-cycle) restart")
     p_install.add_argument("--remove", action="store_true", help="Remove the installed timer")
 
     sub.add_parser("status", help="Show timer status and recent restart log entries")

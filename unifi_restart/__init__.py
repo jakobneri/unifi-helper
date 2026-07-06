@@ -41,6 +41,13 @@ REQUEST_TIMEOUT = 10  # seconds; fail fast once the local link starts dropping
 # Config / session persistence
 # ---------------------------------------------------------------------------
 
+def _normalize_host(host):
+    host = host.strip().rstrip("/")
+    if not re.match(r"^https?://", host):
+        host = f"https://{host}"
+    return host
+
+
 def load_config():
     if not CONFIG_FILE.exists():
         print("No config found. Run 'unifi-restart config' first.", file=sys.stderr)
@@ -76,7 +83,7 @@ def save_session(data):
 
 class UnifiClient:
     def __init__(self, config):
-        self.host = config["host"].rstrip("/")
+        self.host = _normalize_host(config["host"])
         self.username = config["username"]
         self.password = config["password"]
         self.site = config.get("site", "default")
@@ -220,6 +227,7 @@ def cmd_config(_args):
     host = input(f"Host [{existing_host}]: ").strip()
     if not host:
         host = existing_host
+    host = _normalize_host(host)
 
     username = input(f"Username [{existing.get('username', 'admin')}]: ").strip()
     if not username:

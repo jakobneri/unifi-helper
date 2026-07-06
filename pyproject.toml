@@ -3,9 +3,9 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "unifi-led"
+name = "unifi-restart"
 version = "0.1.0"
-description = "Control LED overrides on UniFi devices via the Network API"
+description = "Restart an entire UniFi network (switches, APs, gateway) on a daily schedule via the Network API"
 requires-python = ">=3.8"
 dependencies = ["requests"]
 
@@ -13,8 +13,8 @@ dependencies = ["requests"]
 pretty = ["tabulate"]
 
 [project.scripts]
-unifi-led = "unifi_led:main"
+unifi-restart = "unifi_restart:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["unifi_led*"]
+include = ["unifi_restart*"]

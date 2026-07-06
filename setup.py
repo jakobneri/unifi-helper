@@ -4,7 +4,7 @@ from setuptools.command.develop import develop
 
 
 def _post_install_hint():
-    print("\nAdd to PATH or run via: python -m unifi_led\n")
+    print("\nAdd to PATH or run via: python -m unifi_restart\n")
 
 
 class PostInstall(install):

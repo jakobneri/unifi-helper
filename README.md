@@ -127,10 +127,19 @@ change something.
 
 **For the gateway only**, you get an extra choice: reboot it like every
 other device, or just **toggle the WAN interface** (e.g. `eth1`) down and
-back up for a configurable number of seconds (default 30s). This forces a
-PPPoE/DHCP renegotiation — useful for ISPs like O2 that assign a new public
-IP on reconnect — without rebooting the gateway or touching the LAN side at
-all, so your other devices (and this Pi) stay online throughout.
+back up for a configurable number of seconds (default 30s), plus which PPP
+interface (default `ppp0`) to watch afterwards. This forces a PPPoE
+renegotiation — useful for ISPs like O2 that assign a new public IP on
+reconnect — without rebooting the gateway or touching the LAN side at all,
+so your other devices (and this Pi) stay online throughout.
+
+Note: bringing the WAN link back up is fast (seconds), but some ISPs (O2
+included, observed taking ~7 minutes) delay responding to the new PPPoE
+session for several minutes before handing out a new IP — this is the
+ISP's own throttling, not something this tool controls. `run` waits up to
+10 minutes for the new IP to appear on the PPP interface and logs it once
+confirmed (or logs a timeout if it took even longer), so the gateway step
+of a nightly run can take several minutes to finish.
 
 Settings are saved to `~/.config/unifi-restart/config.json` (mode 600,
 passwords stored in plain text — protected only by file permissions, same
@@ -221,8 +230,9 @@ Last log entries (~/.local/state/unifi-restart/restart.log):
   2026-07-06 03:00:01 INFO Starting full network restart (3 devices)
   2026-07-06 03:00:01 INFO Living Room AP: reboot command sent
   2026-07-06 03:00:02 INFO Office Switch: reboot command sent
-  2026-07-06 03:00:32 INFO EX7 Gateway: WAN port eth1 toggled (30s down)
-  2026-07-06 03:00:02 INFO Restart sequence complete (device reboots happen asynchronously)
+  2026-07-06 03:00:32 INFO EX7 Gateway: WAN port eth1 toggled (30s down), previous public IP 77.2.150.144
+  2026-07-06 03:07:41 INFO EX7 Gateway: new public IP confirmed: 77.2.45.222
+  2026-07-06 03:07:41 INFO Restart sequence complete (device reboots happen asynchronously)
 ```
 
 ---

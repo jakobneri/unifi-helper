@@ -23,6 +23,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import paramiko
@@ -39,6 +40,9 @@ SYSTEMD_DIR = Path("/etc/systemd/system")
 SSH_TIMEOUT = 8  # seconds; fail fast once the local link starts dropping
 SSH_PORT_DEFAULT = 22
 TOGGLE_SECONDS_DEFAULT = 30
+PPP_INTERFACE_DEFAULT = "ppp0"
+IP_CONFIRM_MAX_WAIT = 600  # seconds; O2 has been observed taking ~7 minutes
+IP_CONFIRM_POLL_INTERVAL = 15  # seconds
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +126,48 @@ def _ssh_toggle_port(device, interface, hold_seconds):
             raise RuntimeError(detail or f"'{cmd}' exited with status {exit_status}")
     finally:
         client.close()
+
+
+def _get_wan_ip(device, ppp_interface):
+    # Read-only query, safe to retry freely: reads the public IP straight off
+    # the PPP interface itself rather than calling out to an external "what's
+    # my IP" service, since we already have SSH access to the device that has it.
+    import shlex
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            device["host"],
+            port=device.get("port", SSH_PORT_DEFAULT),
+            username=device["username"],
+            password=device["password"],
+            timeout=SSH_TIMEOUT,
+            banner_timeout=SSH_TIMEOUT,
+            auth_timeout=SSH_TIMEOUT,
+            look_for_keys=False,
+            allow_agent=False,
+        )
+        cmd = f"ip -4 -o addr show {shlex.quote(ppp_interface)}"
+        _, stdout, _ = client.exec_command(cmd, timeout=SSH_TIMEOUT)
+        output = stdout.read().decode(errors="replace")
+        if stdout.channel.recv_exit_status() != 0:
+            return None
+        match = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", output)
+        return match.group(1) if match else None
+    except Exception:
+        return None
+    finally:
+        client.close()
+
+
+def _wait_for_new_wan_ip(device, ppp_interface, previous_ip, max_wait, poll_interval):
+    deadline = time.monotonic() + max_wait
+    while time.monotonic() < deadline:
+        time.sleep(poll_interval)
+        ip = _get_wan_ip(device, ppp_interface)
+        if ip and ip != previous_ip:
+            return ip
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +258,7 @@ def _prompt_device(existing=None):
     action = existing.get("action", "reboot")
     interface = existing.get("interface", "")
     toggle_seconds = existing.get("toggle_seconds", TOGGLE_SECONDS_DEFAULT)
+    ppp_interface = existing.get("ppp_interface", PPP_INTERFACE_DEFAULT)
 
     if gateway:
         action_default = "t" if action == "toggle-port" else "r"
@@ -227,6 +274,9 @@ def _prompt_device(existing=None):
             interface = input(f"WAN interface to toggle (e.g. Port 2 is usually eth1) [{iface_default}]: ").strip() or iface_default
             seconds_in = input(f"Seconds to hold the port down [{toggle_seconds}]: ").strip()
             toggle_seconds = int(seconds_in) if seconds_in else toggle_seconds
+            ppp_interface = input(
+                f"PPP interface to watch for the new public IP [{ppp_interface}]: "
+            ).strip() or ppp_interface
     else:
         action = "reboot"
 
@@ -242,6 +292,7 @@ def _prompt_device(existing=None):
     if action == "toggle-port":
         device["interface"] = interface
         device["toggle_seconds"] = toggle_seconds
+        device["ppp_interface"] = ppp_interface
     return device
 
 
@@ -345,8 +396,28 @@ def cmd_run(args):
             if d.get("action") == "toggle-port":
                 interface = d["interface"]
                 seconds = d.get("toggle_seconds", TOGGLE_SECONDS_DEFAULT)
+                ppp_interface = d.get("ppp_interface", PPP_INTERFACE_DEFAULT)
+
+                before_ip = _get_wan_ip(d, ppp_interface)
                 _ssh_toggle_port(d, interface, seconds)
-                msg = f"{label}: WAN port {interface} toggled ({seconds}s down)"
+                msg = f"{label}: WAN port {interface} toggled ({seconds}s down), previous public IP {before_ip or 'unknown'}"
+                print(msg)
+                logger.info(msg)
+
+                print(f"{label}: waiting up to {IP_CONFIRM_MAX_WAIT}s for a new public IP on {ppp_interface}...")
+                after_ip = _wait_for_new_wan_ip(
+                    d, ppp_interface, before_ip, IP_CONFIRM_MAX_WAIT, IP_CONFIRM_POLL_INTERVAL
+                )
+                if after_ip:
+                    msg = f"{label}: new public IP confirmed: {after_ip}"
+                else:
+                    msg = (
+                        f"{label}: new public IP not confirmed within {IP_CONFIRM_MAX_WAIT}s "
+                        "(device may still be reconnecting)"
+                    )
+                print(msg)
+                logger.info(msg)
+                continue
             else:
                 _ssh_reboot(d)
                 msg = f"{label}: reboot command sent"

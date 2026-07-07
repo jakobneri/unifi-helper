@@ -92,9 +92,13 @@ def _ssh_reboot(device):
 
 
 def _ssh_toggle_port(device, interface, hold_seconds):
-    # Only the WAN link goes down here, not the LAN side we're SSHing in
-    # over, so — unlike a reboot — this command actually completes and we
-    # can wait for its real exit status.
+    # Runs detached (nohup, backgrounded, stdio redirected) on the device
+    # itself, so the down -> sleep -> up sequence still finishes even if
+    # this SSH connection drops or times out partway through. Waiting
+    # synchronously on the whole sequence would risk killing the remote
+    # shell (and leaving the interface down for good) on any hiccup.
+    import shlex
+    iface = shlex.quote(interface)
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
@@ -109,8 +113,9 @@ def _ssh_toggle_port(device, interface, hold_seconds):
             look_for_keys=False,
             allow_agent=False,
         )
-        cmd = f"ip link set {interface} down && sleep {hold_seconds} && ip link set {interface} up"
-        _, stdout, stderr = client.exec_command(cmd, timeout=hold_seconds + SSH_TIMEOUT)
+        inner = f"ip link set {iface} down; sleep {int(hold_seconds)}; ip link set {iface} up"
+        cmd = f"nohup sh -c {shlex.quote(inner)} >/tmp/unifi-restart-toggle.log 2>&1 </dev/null &"
+        _, stdout, stderr = client.exec_command(cmd, timeout=SSH_TIMEOUT)
         exit_status = stdout.channel.recv_exit_status()
         if exit_status != 0:
             detail = stderr.read().decode(errors="replace").strip()
@@ -426,12 +431,14 @@ Environment=HOME={home}
 ExecStart={script} run
 """
 
+    # Deliberately no Persistent=true: it would fire the (disruptive) run
+    # immediately on install/boot if today's scheduled time already passed,
+    # instead of waiting for the next real occurrence.
     timer = f"""[Unit]
 Description=Daily UniFi network restart at {hour:02d}:{minute:02d}
 
 [Timer]
 OnCalendar=*-*-* {hour:02d}:{minute:02d}:00
-Persistent=true
 
 [Install]
 WantedBy=timers.target

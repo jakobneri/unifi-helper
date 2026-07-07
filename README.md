@@ -185,6 +185,12 @@ This installs and enables a `systemd` service + timer
 `unifi-restart run` every day at **03:00**, as the user who invoked `sudo`
 (so it picks up that user's config).
 
+The timer intentionally does **not** use systemd's `Persistent=true`
+catch-up behavior: it only ever runs at the exact scheduled time, never
+immediately on install/boot just because that time already passed today.
+If you installed the timer before this was fixed, re-run `install-timer`
+(same command as above) once to regenerate the unit file with the fix.
+
 Choose a different time:
 
 ```bash

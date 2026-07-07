@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Thin wrapper so the tool can be run as ./unifi-restart from inside the
+# repo, without activating the venv or installing a system-wide symlink.
+set -euo pipefail
+
+# Resolve the real user's home even under sudo, where $HOME is reset to root's.
+TARGET_USER="${SUDO_USER:-$(id -un)}"
+TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
+VENV_PYTHON="$TARGET_HOME/.venv/unifi-restart/bin/python3"
+
+if [[ -x "$VENV_PYTHON" ]]; then
+    exec "$VENV_PYTHON" -m unifi_restart "$@"
+fi
+
+echo "venv not found at $TARGET_HOME/.venv/unifi-restart — run the install steps in README.md first." >&2
+exit 1

@@ -51,6 +51,11 @@ To handle that:
   so you can check what happened after the Pi comes back online, even
   though nothing could reach you over the network during the run itself.
 
+**Exception:** if the gateway is set to `toggle-port` instead of `reboot`
+(see step 2 below), only its WAN interface goes down — the LAN side, and
+therefore this Pi's connectivity, is unaffected. That step of the run
+actually waits for confirmation instead of firing and forgetting.
+
 ---
 
 ## Requirements
@@ -120,6 +125,13 @@ For each device you'll be asked for a name, host/IP, SSH port (default
 lets you add, edit, or remove devices in a loop — run it again any time to
 change something.
 
+**For the gateway only**, you get an extra choice: reboot it like every
+other device, or just **toggle the WAN interface** (e.g. `eth1`) down and
+back up for a configurable number of seconds (default 30s). This forces a
+PPPoE/DHCP renegotiation — useful for ISPs like O2 that assign a new public
+IP on reconnect — without rebooting the gateway or touching the LAN side at
+all, so your other devices (and this Pi) stay online throughout.
+
 Settings are saved to `~/.config/unifi-restart/config.json` (mode 600,
 passwords stored in plain text — protected only by file permissions, same
 as SSH keys typically are on a single-user Pi).
@@ -137,11 +149,11 @@ Check what's configured and in what order devices will be restarted (gateway alw
 Example output:
 
 ```
-Name            Host           Port  Username  Gateway
---------------  -------------  ----  --------  -------
-Living Room AP  192.168.188.2  22    ubnt      no
-Office Switch   192.168.188.3  22    ubnt      no
-EX7 Gateway     192.168.188.1  22    root      yes
+Name            Host           Port  Username  Gateway  Action
+--------------  -------------  ----  --------  -------  -----------------
+Living Room AP  192.168.188.2  22    ubnt      no       reboot
+Office Switch   192.168.188.3  22    ubnt      no       reboot
+EX7 Gateway     192.168.188.1  22    root      yes      toggle eth1 (30s)
 ```
 
 ---
@@ -203,7 +215,7 @@ Last log entries (~/.local/state/unifi-restart/restart.log):
   2026-07-06 03:00:01 INFO Starting full network restart (3 devices)
   2026-07-06 03:00:01 INFO Living Room AP: reboot command sent
   2026-07-06 03:00:02 INFO Office Switch: reboot command sent
-  2026-07-06 03:00:02 WARNING EX7 Gateway: error — timed out
+  2026-07-06 03:00:32 INFO EX7 Gateway: WAN port eth1 toggled (30s down)
   2026-07-06 03:00:02 INFO Restart sequence complete (device reboots happen asynchronously)
 ```
 

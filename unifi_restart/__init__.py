@@ -38,6 +38,7 @@ SYSTEMD_DIR = Path("/etc/systemd/system")
 
 SSH_TIMEOUT = 8  # seconds; fail fast once the local link starts dropping
 SSH_PORT_DEFAULT = 22
+TOGGLE_SECONDS_DEFAULT = 30
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +91,34 @@ def _ssh_reboot(device):
         client.close()
 
 
+def _ssh_toggle_port(device, interface, hold_seconds):
+    # Only the WAN link goes down here, not the LAN side we're SSHing in
+    # over, so — unlike a reboot — this command actually completes and we
+    # can wait for its real exit status.
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            device["host"],
+            port=device.get("port", SSH_PORT_DEFAULT),
+            username=device["username"],
+            password=device["password"],
+            timeout=SSH_TIMEOUT,
+            banner_timeout=SSH_TIMEOUT,
+            auth_timeout=SSH_TIMEOUT,
+            look_for_keys=False,
+            allow_agent=False,
+        )
+        cmd = f"ip link set {interface} down && sleep {hold_seconds} && ip link set {interface} up"
+        _, stdout, stderr = client.exec_command(cmd, timeout=hold_seconds + SSH_TIMEOUT)
+        exit_status = stdout.channel.recv_exit_status()
+        if exit_status != 0:
+            detail = stderr.read().decode(errors="replace").strip()
+            raise RuntimeError(detail or f"'{cmd}' exited with status {exit_status}")
+    finally:
+        client.close()
+
+
 # ---------------------------------------------------------------------------
 # Table formatting
 # ---------------------------------------------------------------------------
@@ -114,6 +143,12 @@ def format_table(rows, headers):
         return "\n".join(lines)
 
 
+def _action_label(d):
+    if d.get("action") == "toggle-port":
+        return f"toggle {d.get('interface', '?')} ({d.get('toggle_seconds', TOGGLE_SECONDS_DEFAULT)}s)"
+    return "reboot"
+
+
 def _print_devices(devices):
     rows = [
         [
@@ -122,10 +157,11 @@ def _print_devices(devices):
             d.get("port", SSH_PORT_DEFAULT),
             d.get("username", "root"),
             "yes" if d.get("gateway") else "no",
+            _action_label(d),
         ]
         for d in devices
     ]
-    print(format_table(rows, ["Name", "Host", "Port", "Username", "Gateway"]))
+    print(format_table(rows, ["Name", "Host", "Port", "Username", "Gateway", "Action"]))
 
 
 # ---------------------------------------------------------------------------
@@ -168,14 +204,40 @@ def _prompt_device(existing=None):
     gw_in = input(f"Is this the gateway/router? [y/N, default {gw_default}]: ").strip().lower()
     gateway = (gw_in == "y") if gw_in else existing.get("gateway", False)
 
-    return {
+    action = existing.get("action", "reboot")
+    interface = existing.get("interface", "")
+    toggle_seconds = existing.get("toggle_seconds", TOGGLE_SECONDS_DEFAULT)
+
+    if gateway:
+        action_default = "t" if action == "toggle-port" else "r"
+        action_in = input(
+            "On restart, [r]eboot the whole gateway or just [t]oggle the WAN port "
+            f"to renew the public IP (e.g. PPPoE with dynamic IP)? [R/t, default {action_default}]: "
+        ).strip().lower()
+        if action_in:
+            action = "toggle-port" if action_in == "t" else "reboot"
+
+        if action == "toggle-port":
+            iface_default = interface or "eth1"
+            interface = input(f"WAN interface to toggle (e.g. Port 2 is usually eth1) [{iface_default}]: ").strip() or iface_default
+            seconds_in = input(f"Seconds to hold the port down [{toggle_seconds}]: ").strip()
+            toggle_seconds = int(seconds_in) if seconds_in else toggle_seconds
+    else:
+        action = "reboot"
+
+    device = {
         "name": name,
         "host": host,
         "port": port,
         "username": username,
         "password": password,
         "gateway": gateway,
+        "action": action,
     }
+    if action == "toggle-port":
+        device["interface"] = interface
+        device["toggle_seconds"] = toggle_seconds
+    return device
 
 
 def _prompt_index(devices, verb):
@@ -262,10 +324,10 @@ def cmd_run(args):
     devices = _restart_order(devices)
 
     if args.dry_run:
-        print("Would reboot the following devices (in this order):")
+        print("Would perform the following actions (in this order):")
         for d in devices:
             label = d.get("name") or d["host"]
-            print(f"  {label} ({d['host']}){' [gateway]' if d.get('gateway') else ''}")
+            print(f"  {label} ({d['host']}) -> {_action_label(d)}{' [gateway]' if d.get('gateway') else ''}")
         return
 
     logger = _get_logger()
@@ -275,9 +337,16 @@ def cmd_run(args):
     for d in devices:
         label = d.get("name") or d["host"]
         try:
-            _ssh_reboot(d)
-            print(f"{label}: reboot command sent")
-            logger.info("%s: reboot command sent", label)
+            if d.get("action") == "toggle-port":
+                interface = d["interface"]
+                seconds = d.get("toggle_seconds", TOGGLE_SECONDS_DEFAULT)
+                _ssh_toggle_port(d, interface, seconds)
+                msg = f"{label}: WAN port {interface} toggled ({seconds}s down)"
+            else:
+                _ssh_reboot(d)
+                msg = f"{label}: reboot command sent"
+            print(msg)
+            logger.info(msg)
         except Exception as e:
             # Expected once the device carrying our own uplink goes down.
             print(f"{label}: error — {e}", file=sys.stderr)

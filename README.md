@@ -80,25 +80,17 @@ pip install -e .
 pip install tabulate
 ```
 
-The `unifi-restart` command is now available **while the venv is active**.
-
-**Activate the venv in future terminal sessions:**
-
-```bash
-source ~/.venv/unifi-restart/bin/activate
-```
-
-Or add that line to your `~/.bashrc` so it activates automatically on login:
+From inside the repo directory, run the tool via the included wrapper —
+no venv activation needed:
 
 ```bash
-echo 'source ~/.venv/unifi-restart/bin/activate' >> ~/.bashrc
+./unifi-restart --help
 ```
 
-You can also run without activating the venv:
-
-```bash
-~/.venv/unifi-restart/bin/unifi-restart --help
-```
+(This is what the rest of this README uses. If you'd rather have
+`unifi-restart` available everywhere, activate the venv with
+`source ~/.venv/unifi-restart/bin/activate`, or symlink the wrapper into
+`/usr/local/bin`.)
 
 > The `install-timer` command (below) looks for the tool at
 > `~/.venv/unifi-restart/bin/unifi-restart` first, so installing into that
@@ -120,7 +112,7 @@ You can also run without activating the venv:
 ### 2. Run the configuration wizard
 
 ```bash
-unifi-restart config
+./unifi-restart config
 ```
 
 For each device you'll be asked for a name, host/IP, SSH port (default
@@ -139,7 +131,7 @@ as SSH keys typically are on a single-user Pi).
 Check what's configured and in what order devices will be restarted (gateway always last):
 
 ```bash
-unifi-restart list
+./unifi-restart list
 ```
 
 Example output:
@@ -157,7 +149,7 @@ EX7 Gateway     192.168.188.1  22    root      yes
 ### 4. Do a dry run
 
 ```bash
-unifi-restart run --dry-run
+./unifi-restart run --dry-run
 ```
 
 ---
@@ -165,7 +157,7 @@ unifi-restart run --dry-run
 ### 5. Restart everything now
 
 ```bash
-unifi-restart run
+./unifi-restart run
 ```
 
 ---
@@ -173,7 +165,7 @@ unifi-restart run
 ### 6. Install the daily 3am timer
 
 ```bash
-sudo unifi-restart install-timer
+sudo ./unifi-restart install-timer
 ```
 
 This installs and enables a `systemd` service + timer
@@ -184,13 +176,13 @@ This installs and enables a `systemd` service + timer
 Choose a different time:
 
 ```bash
-sudo unifi-restart install-timer --time 03:30
+sudo ./unifi-restart install-timer --time 03:30
 ```
 
 Remove the timer:
 
 ```bash
-sudo unifi-restart install-timer --remove
+sudo ./unifi-restart install-timer --remove
 ```
 
 ---
@@ -198,7 +190,7 @@ sudo unifi-restart install-timer --remove
 ### 7. Check status
 
 ```bash
-unifi-restart status
+./unifi-restart status
 ```
 
 Shows the timer's next scheduled run plus the last few log entries:
@@ -220,11 +212,11 @@ Last log entries (~/.local/state/unifi-restart/restart.log):
 ## Command reference
 
 ```
-unifi-restart config                          # interactive device configuration (add/edit/remove)
-unifi-restart list                            # list configured devices and restart order
-unifi-restart run [--dry-run]                 # reboot every configured device now
-unifi-restart install-timer [--time HH:MM] [--remove]  # manage the daily systemd timer
-unifi-restart status                          # show timer status + recent log entries
+./unifi-restart config                          # interactive device configuration (add/edit/remove)
+./unifi-restart list                            # list configured devices and restart order
+./unifi-restart run [--dry-run]                 # reboot every configured device now
+sudo ./unifi-restart install-timer [--time HH:MM] [--remove]  # manage the daily systemd timer
+./unifi-restart status                          # show timer status + recent log entries
 ```
 
 ---
